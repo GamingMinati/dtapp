@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no">
+<title>StuntWatch — AI Fall Tracker</title>
+
+<!-- Fonts: Teko (poster/marquee display) + Inter (body/UI) -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Teko:wght@500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+<!-- Tailwind (Play CDN) -->
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          ink:      '#0B0F14',
+          panel:    '#121821',
+          panel2:   '#17202B',
+          line:     '#232E3B',
+          amber:    '#F5B942',
+          danger:   '#FF4757',
+          ok:       '#33D69F',
+          muted:    '#8AA0B4',
+          paper:    '#F2F5F7',
+        },
+        fontFamily: {
+          display: ['"Teko"', 'sans-serif'],
+          body: ['"Inter"', 'sans-serif'],
+        },
+      }
+    }
+  }
+</script>
+
+<!-- TensorFlow.js + Pose Detection (MoveNet) -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3/dist/pose-detection.min.js"></script>
+
+<style>
+  html, body { background:#0B0F14; }
+  * { -webkit-tap-highlight-color: transparent; }
+
+  /* Video/canvas mirrored together so overlay lines up with the selfie view */
+  #video, #overlay { transform: scaleX(-1); }
+
+  .tnum { font-variant-numeric: tabular-nums; }
+
+  /* Screen flash on a scored fall */
+  #flash {
+    position: absolute; inset: 0; background: #FF4757;
+    opacity: 0; pointer-events: none; transition: opacity 120ms ease-out;
+  }
+  #flash.hit { opacity: 0.55; transition: opacity 40ms ease-out; }
+
+  /* Pulsing vitals ring around the score — the app's signature element */
+  .ring-wrap { position: relative; width: 208px; height: 208px; }
+  .ring-wrap svg { transform: rotate(-90deg); }
+  .ring-track { stroke: #1E2733; }
+  .ring-sweep {
+    stroke: var(--ring-color, #33D69F);
+    stroke-linecap: round;
+    transition: stroke 300ms ease, stroke-dashoffset 300ms ease;
+    filter: drop-shadow(0 0 6px var(--ring-color, #33D69F));
+  }
+  .ring-pulse {
+    position: absolute; inset: 0; border-radius: 9999px;
+    box-shadow: 0 0 0 0 var(--ring-color, #33D69F);
+    animation: pulse 1.8s ease-out infinite;
+  }
+  [data-state="fall"] .ring-pulse { animation-duration: 0.6s; }
+  [data-state="cooldown"] .ring-pulse { animation-duration: 1s; }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ring-color) 55%, transparent); }
+    70%  { box-shadow: 0 0 0 22px transparent; }
+    100% { box-shadow: 0 0 0 0 transparent; }
+  }
+
+  /* Status dot breathing */
+  .dot { animation: breathe 1.6s ease-in-out infinite; }
+  @keyframes breathe { 0%,100% { opacity: .45; } 50% { opacity: 1; } }
+
+  .scan-in { animation: scanIn 420ms ease-out; }
+  @keyframes scanIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-thumb { background: #232E3B; border-radius: 4px; }
+</style>
+</head>
+
+<body class="font-body bg-ink text-paper min-h-screen flex flex-col items-center pb-12">
+
+  <!-- Header -->
+  <header class="w-full max-w-md px-5 pt-8 pb-4">
+    <p class="text-[11px] tracking-[0.28em] text-amber font-semibold uppercase">AI Motion Tracker · On-Device</p>
+    <h1 class="font-display text-6xl leading-none font-semibold tracking-wide mt-1">STUNT<span class="text-amber">WATCH</span></h1>
+    <p class="text-muted text-sm mt-2 leading-snug">Point the camera at your mark. Every clean, camera-confirmed fall lands you <span class="text-paper font-medium">+10 points</span>.</p>
+  </header>
+
+  <!-- Camera card -->
+  <main class="w-full max-w-md px-5 flex flex-col gap-5">
+
+    <section class="relative w-full aspect-[3/4] rounded-2xl overflow-hidden bg-black border border-line shadow-[0_0_0_1px_rgba(255,255,255,0.02)]">
+      <video id="video" class="absolute inset-0 w-full h-full object-cover" playsinline muted></video>
+      <canvas id="overlay" class="absolute inset-0 w-full h-full"></canvas>
+      <div id="flash" class="absolute inset-0"></div>
+
+      <!-- Status pill -->
+      <div class="absolute top-3 left-3 flex items-center gap-2 bg-black/55 backdrop-blur px-3 py-1.5 rounded-full border border-white/10">
+        <span id="statusDot" class="w-2 h-2 rounded-full bg-muted dot"></span>
+        <span id="statusText" class="text-xs font-semibold tracking-wide uppercase">Camera Off</span>
+      </div>
+
+      <!-- Take counter -->
+      <div class="absolute top-3 right-3 bg-black/55 backdrop-blur px-3 py-1.5 rounded-full border border-white/10">
+        <span class="text-xs text-muted">Take </span><span id="fallCount" class="text-xs font-semibold">0</span>
+      </div>
+
+      <!-- Idle / error overlay -->
+      <div id="idleOverlay" class="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-black/85 px-8 text-center">
+        <div class="w-14 h-14 rounded-full border border-line flex items-center justify-center">
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6 text-amber" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+            <path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/>
+          </svg>
+        </div>
+        <p id="idleTitle" class="font-display text-2xl tracking-wide">CAMERA STANDS BY</p>
+        <p id="idleMsg" class="text-muted text-sm max-w-[26ch]">Start the camera to begin tracking your marks. Works entirely on your device — nothing is uploaded.</p>
+      </div>
+    </section>
+
+    <!-- Controls -->
+    <section class="flex gap-3">
+      <button id="startBtn" class="flex-1 bg-amber text-ink font-semibold text-sm uppercase tracking-wide rounded-xl py-3.5 active:scale-[0.98] transition">
+        Start Camera
+      </button>
+      <button id="stopBtn" class="hidden flex-1 bg-panel2 border border-line text-paper font-semibold text-sm uppercase tracking-wide rounded-xl py-3.5 active:scale-[0.98] transition">
+        Stop Camera
+      </button>
+      <button id="resetBtn" class="w-14 flex items-center justify-center bg-panel2 border border-line rounded-xl active:scale-[0.98] transition" title="Reset score">
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5 text-muted" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+        </svg>
+      </button>
+    </section>
+
+    <!-- Score arena -->
+    <section class="bg-panel border border-line rounded-2xl py-7 flex flex-col items-center">
+      <p class="text-[11px] tracking-[0.28em] text-muted font-semibold uppercase mb-3">Take Score</p>
+      <div id="ringWrap" class="ring-wrap" data-state="idle">
+        <div class="ring-pulse"></div>
+        <svg width="208" height="208" viewBox="0 0 208 208">
+          <circle class="ring-track" cx="104" cy="104" r="92" fill="none" stroke-width="10"/>
+          <circle id="ringSweep" class="ring-sweep" cx="104" cy="104" r="92" fill="none" stroke-width="10"
+                  stroke-dasharray="578" stroke-dashoffset="578"/>
+        </svg>
+        <div class="absolute inset-0 flex flex-col items-center justify-center">
+          <span id="score" class="tnum font-display text-7xl font-semibold leading-none">0</span>
+          <span class="text-[11px] tracking-[0.3em] text-muted font-semibold mt-1">PTS</span>
+        </div>
+      </div>
+      <p id="bigStatus" class="font-display text-2xl tracking-wide mt-4 text-muted">STANDING BY</p>
+    </section>
+
+    <!-- Take log -->
+    <section class="bg-panel border border-line rounded-2xl p-4">
+      <p class="text-[11px] tracking-[0.28em] text-muted font-semibold uppercase mb-3">Take Log</p>
+      <ul id="log" class="flex flex-col gap-2">
+        <li class="text-sm text-muted">No takes recorded yet. Land a fall to start the log.</li>
+      </ul>
+    </section>
+
+  </main>
+
+<script>
+(() => {
+  // ---------- DOM ----------
+  const video       = document.getElementById('video');
+  const overlay     = document.getElementById('overlay');
+  const octx        = overlay.getContext('2d');
+  const flashEl     = document.getElementById('flash');
+  const idleOverlay = document.getElementById('idleOverlay');
+  const idleTitle   = document.getElementById('idleTitle');
+  const idleMsg     = document.getElementById('idleMsg');
+  const startBtn    = document.getElementById('startBtn');
+  const stopBtn     = document.getElementById('stopBtn');
+  const resetBtn    = document.getElementById('resetBtn');
+  const statusDot   = document.getElementById('statusDot');
+  const statusText  = document.getElementById('statusText');
+  const bigStatus   = document.getElementById('bigStatus');
+  const scoreEl     = document.getElementById('score');
+  const fallCountEl = document.getElementById('fallCount');
+  const ringWrap    = document.getElementById('ringWrap');
+  const ringSweep   = document.getElementById('ringSweep');
+  const logEl       = document.getElementById('log');
+
+  const RING_CIRC = 578; // 2 * PI * 92, matches SVG circle
+
+  // ---------- Tunable thresholds ----------
+  const FALL_VELOCITY_THRESHOLD = 0.7;   // normalized frame-heights / second (downward hip movement)
+  const HORIZONTAL_ASPECT       = 1.3;   // bbox width/height above this = lying down
+  const UPRIGHT_ASPECT          = 0.9;   // bbox width/height below this = standing
+  const UPRIGHT_HOLD_MS         = 600;   // must stay upright this long before we re-arm
+  const COOLDOWN_MS             = 2000;  // no new fall can score during this window
+  const HISTORY_WINDOW_MS       = 900;   // how far back we look for the velocity check
+  const MIN_KEYPOINTS           = 6;     // minimum confident keypoints before we trust a pose
+
+  const KEYPOINT_PAIRS = [
+    ['left_shoulder','right_shoulder'], ['left_shoulder','left_elbow'], ['left_elbow','left_wrist'],
+    ['right_shoulder','right_elbow'], ['right_elbow','right_wrist'],
+    ['left_shoulder','left_hip'], ['right_shoulder','right_hip'], ['left_hip','right_hip'],
+    ['left_hip','left_knee'], ['left_knee','left_ankle'], ['right_hip','right_knee'], ['right_knee','right_ankle'],
+    ['left_shoulder','left_ear'], ['right_shoulder','right_ear'],
+  ];
+
+  // ---------- State ----------
+  let detector = null;
+  let stream = null;
+  let rafId = null;
+  let audioCtx = null;
+
+  let appState = 'idle';     // idle | standing | fall | cooldown | down
+  let score = 0;
+  let fallCount = 0;
+  let history = [];          // { t, hipY, aspect }
+  let cooldownEnd = 0;
+  let uprightSince = null;
+
+  // ---------- State machine / UI ----------
+  const STATE_META = {
+    idle:     { label: 'Camera Off',    big: 'STANDING BY',      color: '#8AA0B4', dot: 'bg-muted' },
+    standing: { label: 'Standing',      big: 'STANDING',         color: '#33D69F', dot: 'bg-ok' },
+    fall:     { label: 'Fall Detected!',big: 'FALL DETECTED!',   color: '#FF4757', dot: 'bg-danger' },
+    cooldown: { label: 'Cooling Down',  big: 'COOLING DOWN',     color: '#F5B942', dot: 'bg-amber' },
+    down:     { label: 'Get Up',        big: 'GET UP TO RESET',  color: '#F5B942', dot: 'bg-amber' },
+  };
+
+  function setState(next) {
+    appState = next;
+    const meta = STATE_META[next];
+    statusText.textContent = meta.label;
+    bigStatus.textContent = meta.big;
+    bigStatus.style.color = next === 'idle' ? '#8AA0B4' : '#F2F5F7';
+    statusDot.className = `w-2 h-2 rounded-full dot ${meta.dot}`;
+    ringWrap.dataset.state = next;
+    ringWrap.style.setProperty('--ring-color', meta.color);
+  }
+
+  function updateScoreUI() {
+    scoreEl.textContent = score;
+    fallCountEl.textContent = fallCount;
+    const pct = Math.min(1, (fallCount % 10) / 10 || (fallCount > 0 ? 1 : 0));
+    ringSweep.style.strokeDashoffset = RING_CIRC - pct * RING_CIRC;
+    scoreEl.animate(
+      [{ transform: 'scale(1)' }, { transform: 'scale(1.12)' }, { transform: 'scale(1)' }],
+      { duration: 320, easing: 'ease-out' }
+    );
+  }
+
+  function flashScreen() {
+    flashEl.classList.add('hit');
+    setTimeout(() => flashEl.classList.remove('hit'), 160);
+  }
+
+  function playBeep() {
+    try {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const now = audioCtx.currentTime;
+      [880, 1320].forEach((freq, i) => {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'square';
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.0001, now + i * 0.09);
+        gain.gain.exponentialRampToValueAtTime(0.18, now + i * 0.09 + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.09 + 0.14);
+        osc.connect(gain).connect(audioCtx.destination);
+        osc.start(now + i * 0.09);
+        osc.stop(now + i * 0.09 + 0.16);
+      });
+    } catch (e) { /* audio not critical */ }
+  }
+
+  function logTake() {
+    if (logEl.children.length === 1 && logEl.children[0].dataset.placeholder) {
+      logEl.innerHTML = '';
+    }
+    const li = document.createElement('li');
+    li.className = 'scan-in flex items-center justify-between text-sm bg-panel2 border border-line rounded-lg px-3 py-2';
+    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    li.innerHTML = `<span>Take <span class="font-semibold">#${fallCount}</span> confirmed</span>
+                     <span class="text-muted tnum">${time} · <span class="text-amber font-semibold">+10</span></span>`;
+    logEl.prepend(li);
+    while (logEl.children.length > 5) logEl.removeChild(logEl.lastChild);
+  }
+
+  function resetAll() {
+    score = 0; fallCount = 0; history = []; uprightSince = null;
+    updateScoreUI();
+    ringSweep.style.strokeDashoffset = RING_CIRC;
+    logEl.innerHTML = '<li data-placeholder="true" class="text-sm text-muted">No takes recorded yet. Land a fall to start the log.</li>';
+    if (appState !== 'idle') setState('standing');
+  }
+
+  // ---------- Fall detection ----------
+  function triggerFall() {
+    score += 10;
+    fallCount += 1;
+    setState('fall');
+    flashScreen();
+    playBeep();
+    updateScoreUI();
+    logTake();
+    cooldownEnd = performance.now() + COOLDOWN_MS;
+    setTimeout(() => { if (appState !== 'idle') setState('cooldown'); }, 250);
+  }
+
+  function afterCooldown() {
+    const last = history[history.length - 1];
+    if (last && last.aspect > HORIZONTAL_ASPECT) {
+      uprightSince = null;
+      setState('down');
+    } else {
+      setState('standing');
+    }
+  }
+
+  function processPose(keypoints, now) {
+    const pts = {};
+    for (const kp of keypoints) if (kp.score > 0.3) pts[kp.name] = kp;
+    const valid = Object.values(pts);
+    if (valid.length < MIN_KEYPOINTS) return;
+
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of valid) {
+      minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+      minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+    }
+    const width = Math.max(1, maxX - minX);
+    const height = Math.max(1, maxY - minY);
+    const aspect = width / height;
+
+    let hipY;
+    if (pts.left_hip && pts.right_hip) hipY = (pts.left_hip.y + pts.right_hip.y) / 2;
+    else if (pts.left_hip) hipY = pts.left_hip.y;
+    else if (pts.right_hip) hipY = pts.right_hip.y;
+    else hipY = (minY + maxY) / 2;
+
+    history.push({ t: now, hipY, aspect });
+    history = history.filter(h => now - h.t <= HISTORY_WINDOW_MS);
+
+    let dropDetected = false;
+    if (history.length >= 2) {
+      const oldest = history[0];
+      const dt = (now - oldest.t) / 1000;
+      if (dt > 0.05) {
+        const dy = (hipY - oldest.hipY) / video.videoHeight; // normalized, positive = moving down
+        const velocity = dy / dt;
+        if (velocity > FALL_VELOCITY_THRESHOLD) dropDetected = true;
+      }
+    }
+
+    const isHorizontal = aspect > HORIZONTAL_ASPECT;
+    const isUpright = aspect < UPRIGHT_ASPECT;
+
+    if (appState === 'standing') {
+      if (dropDetected && isHorizontal) triggerFall();
+    } else if (appState === 'down') {
+      if (isUpright) {
+        if (!uprightSince) uprightSince = now;
+        else if (now - uprightSince > UPRIGHT_HOLD_MS) { uprightSince = null; setState('standing'); }
+      } else {
+        uprightSince = null;
+      }
+    }
+  }
+
+  function drawSkeleton(keypoints) {
+    octx.clearRect(0, 0, overlay.width, overlay.height);
+    const pts = {};
+    for (const kp of keypoints) if (kp.score > 0.3) pts[kp.name] = kp;
+
+    octx.strokeStyle = 'rgba(245, 185, 66, 0.85)';
+    octx.lineWidth = 3;
+    for (const [a, b] of KEYPOINT_PAIRS) {
+      if (pts[a] && pts[b]) {
+        octx.beginPath();
+        octx.moveTo(pts[a].x, pts[a].y);
+        octx.lineTo(pts[b].x, pts[b].y);
+        octx.stroke();
+      }
+    }
+    octx.fillStyle = '#F2F5F7';
+    for (const name in pts) {
+      octx.beginPath();
+      octx.arc(pts[name].x, pts[name].y, 4, 0, Math.PI * 2);
+      octx.fill();
+    }
+  }
+
+  // ---------- Main loop ----------
+  async function loop() {
+    if (appState === 'idle') return;
+
+    if (appState === 'cooldown' && performance.now() >= cooldownEnd) {
+      afterCooldown();
+    }
+
+    try {
+      const poses = await detector.estimatePoses(video, { flipHorizontal: false });
+      if (poses[0] && poses[0].keypoints) {
+        drawSkeleton(poses[0].keypoints);
+        processPose(poses[0].keypoints, performance.now());
+      } else {
+        octx.clearRect(0, 0, overlay.width, overlay.height);
+      }
+    } catch (e) {
+      console.error('Pose estimation error:', e);
+    }
+
+    rafId = requestAnimationFrame(loop);
+  }
+
+  // ---------- Camera lifecycle ----------
+  async function ensureDetector() {
+    if (detector) return;
+    await tf.ready();
+    try { await tf.setBackend('webgl'); } catch (e) { await tf.setBackend('cpu'); }
+    detector = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, {
+      modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
+    });
+  }
+
+  function showIdleMessage(title, msg) {
+    idleTitle.textContent = title;
+    idleMsg.textContent = msg;
+    idleOverlay.classList.remove('hidden');
+  }
+
+  async function startCamera() {
+    startBtn.disabled = true;
+    startBtn.textContent = 'Loading model…';
+    try {
+      showIdleMessage('CAMERA STANDS BY', 'Requesting camera access…');
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 854 } },
+        audio: false,
+      });
+      video.srcObject = stream;
+      await video.play();
+      overlay.width = video.videoWidth;
+      overlay.height = video.videoHeight;
+
+      await ensureDetector();
+
+      idleOverlay.classList.add('hidden');
+      startBtn.classList.add('hidden');
+      stopBtn.classList.remove('hidden');
+      startBtn.disabled = false;
+      startBtn.textContent = 'Start Camera';
+
+      history = [];
+      uprightSince = null;
+      setState('standing');
+      loop();
+    } catch (err) {
+      startBtn.disabled = false;
+      startBtn.textContent = 'Start Camera';
+      let title = 'CAMERA UNAVAILABLE';
+      let msg = 'Something went wrong starting the camera. Please try again.';
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        title = 'CAMERA ACCESS DENIED';
+        msg = 'Enable camera permissions for this site in your browser settings, then reload the page and try again.';
+      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+        title = 'NO CAMERA FOUND';
+        msg = 'We couldn\'t find a camera on this device. Connect one and try again.';
+      } else if (err.name === 'NotReadableError') {
+        title = 'CAMERA IN USE';
+        msg = 'Your camera may be in use by another app. Close it and try again.';
+      }
+      showIdleMessage(title, msg);
+      setState('idle');
+      console.error(err);
+    }
+  }
+
+  function stopCamera() {
+    if (rafId) cancelAnimationFrame(rafId);
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null;
+    octx.clearRect(0, 0, overlay.width, overlay.height);
+    setState('idle');
+    startBtn.classList.remove('hidden');
+    stopBtn.classList.add('hidden');
+    showIdleMessage('CAMERA STANDS BY', 'Start the camera to begin tracking your marks. Works entirely on your device — nothing is uploaded.');
+  }
+
+  // ---------- Wire up ----------
+  startBtn.addEventListener('click', startCamera);
+  stopBtn.addEventListener('click', stopCamera);
+  resetBtn.addEventListener('click', resetAll);
+
+  setState('idle');
+  ringSweep.style.strokeDashoffset = RING_CIRC;
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showIdleMessage('CAMERA UNSUPPORTED', 'This browser doesn\'t support camera access. Try the latest Chrome, Safari, or Edge.');
+    startBtn.disabled = true;
+  }
+})();
+</script>
+</body>
+</html>
